@@ -178,9 +178,13 @@ void Boids::initSimulation(int N) {
   cudaMalloc((void**)&dev_particleArrayIndices, N * sizeof(int));
   checkCUDAErrorWithLine("cudaMalloc dev_particleArrayIndices failed!");
 
+  dev_thrust_particleArrayIndices = thrust::device_pointer_cast(dev_particleArrayIndices);
+
   // Pointer from grid index to boid.
   cudaMalloc((void**)&dev_particleGridIndices, N * sizeof(int));
   checkCUDAErrorWithLine("cudaMalloc dev_particleArrayIndices failed!");
+
+  dev_thrust_particleGridIndices = thrust::device_pointer_cast(dev_particleGridIndices);
 
   // Pointer from cell to start index in dev_particleArrayIndices.
   cudaMalloc((void**)&dev_gridCellStartIndices, gridCellCount * sizeof(int));
@@ -304,24 +308,21 @@ __device__ glm::vec3 computeVelocityChange(int N, int iSelf, const glm::vec3 *po
     // Process Rules.
     glm::vec3 resultBoids = glm::vec3(0.f, 0.f, 0.f);
     // Rule 1:
-    if (rule1Distance > 0.f && numNeighboursRule1 > 0)
+    if (numNeighboursRule1 > 0)
     {
         perceived_center /= numNeighboursRule1;
         resultBoids += (perceived_center - currBoidPos) * rule1Scale;
     }
     // Rule 2:
-    if (rule2Distance > 0.f)
-    {
-        resultBoids += c * rule2Scale;
-    }
+    resultBoids += c * rule2Scale;
     // Rule 3:
-    if (rule3Distance > 0.f && numNeighboursRule3 > 0)
+    if (numNeighboursRule3 > 0)
     {
         perceived_velocity /= numNeighboursRule3;
         resultBoids += perceived_velocity * rule3Scale;
     }
 
-  return resultBoids;
+  return resultBoids + currBoidVel;
 }
 
 /**
@@ -346,7 +347,7 @@ __global__ void kernUpdateVelocityBruteForce(int N, glm::vec3 *pos,
     float speed = glm::length(newVelocity);
     if (speed > maxSpeed)
     {
-        newVelocity = (newVelocity / speed) * maxSpeed;
+        newVelocity = glm::normalize(newVelocity) * maxSpeed;
     }
 
     vel2[index] = newVelocity;
@@ -432,17 +433,18 @@ __global__ void kernIdentifyCellStartEnd(int N, int *particleGridIndices,
         return;
     }
 
+    int currBoidGridIndex = particleGridIndices[index];
+
     // Set up start and end boid.
     if (index == 0) {
-        gridCellStartIndices[particleGridIndices[0]] = 0;
+        gridCellStartIndices[currBoidGridIndex] = 0;
     }
     else if (index == N - 1) {
-        gridCellEndIndices[particleGridIndices[N - 1]] = N - 1;
+        gridCellEndIndices[currBoidGridIndex] = N - 1;
     }
 
     // The rest of the boids.
     else {
-        int currBoidGridIndex = particleGridIndices[index];
         int prevBoidGridIndex = particleGridIndices[index - 1];
 
         if (currBoidGridIndex != prevBoidGridIndex) {
@@ -482,6 +484,7 @@ __global__ void kernUpdateVelNeighborSearchScattered(
 
     int boidIdx = particleArrayIndices[index];
     glm::vec3 currPos = pos[index];
+    glm::vec3 currVel = vel1[index];
     glm::vec3 gridPos = glm::floor((currPos - gridMin) * inverseCellWidth);
 
     for (int x = imax(gridPos.x - 1, 0); x < imin(gridPos.x + 1, gridResolution - 1); x++) {
@@ -501,6 +504,7 @@ __global__ void kernUpdateVelNeighborSearchScattered(
                 }
 
                 for (int i = startIdx; i <= endIdx; i++) {
+                    // Current neighbouring cell.
                     int currBoidIdx = particleArrayIndices[i];
 
                     if (currBoidIdx == boidIdx) {
@@ -508,22 +512,22 @@ __global__ void kernUpdateVelNeighborSearchScattered(
                     }
 
                     // Get dist for every other boid and curr boid.
-                    float dist = glm::distance(pos[currBoidIdx], pos[boidIdx]);
+                    float dist = glm::distance(pos[currBoidIdx], currPos);
                     // Rule 1 calc.
                     if (dist < rule1Distance)
                     {
-                        perceived_center += pos[boidIdx];
+                        perceived_center += pos[currBoidIdx];
                         numNeighboursRule1++;
                     }
                     //Rule 2 calc.
                     if (dist < rule2Distance)
                     {
-                        c -= pos[boidIdx] - pos[currBoidIdx];
+                        c -= pos[currBoidIdx] - currPos;
                     }
                     // Rule 3 calc.
                     if (dist < rule3Distance)
                     {
-                        perceived_velocity += vel1[boidIdx];
+                        perceived_velocity += vel1[currBoidIdx];
                         numNeighboursRule3++;
                     }
                 }
@@ -532,24 +536,22 @@ __global__ void kernUpdateVelNeighborSearchScattered(
     }
 
     // Rule 1:
-    if (rule1Distance > 0.f && numNeighboursRule1 > 0)
+    if (numNeighboursRule1 > 0)
     {
         perceived_center /= numNeighboursRule1;
         resultBoids += (perceived_center - currPos) * rule1Scale;
     }
     // Rule 2:
-    if (rule2Distance > 0.f)
-    {
-        resultBoids += c * rule2Scale;
-    }
+    
+     resultBoids += c * rule2Scale;
     // Rule 3:
-    if (rule3Distance > 0.f && numNeighboursRule3 > 0)
+    if (numNeighboursRule3 > 0)
     {
         perceived_velocity /= numNeighboursRule3;
         resultBoids += perceived_velocity * rule3Scale;
     }
 
-    resultBoids += vel1[index];
+    resultBoids += currVel;
     float speed = glm::length(resultBoids);
     if (speed > maxSpeed) {
         resultBoids = glm::normalize(resultBoids) * maxSpeed;
@@ -678,9 +680,7 @@ void Boids::stepSimulationNaive(float dt) {
     kernUpdatePos<<<fullBlocksPerGrid, blockSize >>>(numObjects, dt, dev_pos, dev_vel2);
     cudaDeviceSynchronize();
 
-    glm::vec3 *temp = dev_vel1;
-    dev_vel1 = dev_vel2;
-    dev_vel2 = temp;
+    std::swap(dev_vel1, dev_vel2);
 }
 
 void Boids::stepSimulationScatteredGrid(float dt) {
